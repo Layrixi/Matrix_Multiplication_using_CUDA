@@ -6,8 +6,8 @@
 #include <stdio.h>
 #include <iostream>
 
-const int size = 1024;
-double wyniki_przyk[6];
+const int size = 1024;//works only for powers of 2, need to repair later
+double results[6];//an array to compare if the results were correct
 
 void printMatrix(float **matrix) {
     for (int i = 0; i < size; i++) {
@@ -20,7 +20,8 @@ void printMatrix(float **matrix) {
 
 void printCudaMatrix(float* matrix)
 {
-    for (int i = 0; i < size * size; i++)
+    long int cudaSize = size * size;
+    for (int i = 0; i < cudaSIZE; i++)
         std::cout << matrix[i] << "   |";
 }
 
@@ -30,10 +31,9 @@ __global__ void mult(float* a, float* b, float* c)
     int j = threadIdx.x + blockIdx.x * blockDim.x;//col
     int i = threadIdx.y + blockIdx.y * blockDim.y;//row
     float sum=0;
-    for (int przesuniecie = 0; przesuniecie < size; przesuniecie++)
-    {
-        sum += a[i * size + przesuniecie] * b[przesuniecie * size + j];
-    }
+    for (int shift = 0; shift < size; shift++)
+        sum += a[i * size + shift] * b[shift * size + j];
+    
     c[i*size+j] = sum;
 }
 
@@ -54,9 +54,9 @@ cudaError_t CudaMultiplyMatrixes(float **aORG, float **bORG)
     for (int i = 0; i < size*size; i++)
             c[i] = 0;
 
-    float* doCudaA = 0;
-    float* doCudaB = 0;
-    float* doCudaC = 0;
+    float* cudaMatrixA = 0;
+    float* cudaMatrixB = 0;
+    float* cudaMatrixC = 0;
     cudaError_t cudaStatus;
 
     //set gpu
@@ -66,9 +66,9 @@ cudaError_t CudaMultiplyMatrixes(float **aORG, float **bORG)
         goto Error;
     }
 
-    //malloci na zmienne
-    size_t pitch;//kind of wyrownanie zarezerwowanej pamieci dla efektywniejszego liczenia ceną zwiększenia wykorzystywanej pamieci
-    cudaStatus = cudaMallocPitch(&doCudaA, &pitch, size * sizeof(float), size);
+    //cudaMallocs with pitch for variables
+    size_t pitch;
+    cudaStatus = cudaMallocPitch(&cudaMatrixA, &pitch, size * sizeof(float), size);
     if (cudaStatus != cudaSuccess) 
     {
         fprintf(stderr, "cudaMalloc failed!");
@@ -76,14 +76,14 @@ cudaError_t CudaMultiplyMatrixes(float **aORG, float **bORG)
     }
 
     size_t pitch2;
-    cudaStatus = cudaMallocPitch(&doCudaB, &pitch2, size * sizeof(float), size);
+    cudaStatus = cudaMallocPitch(&cudaMatrixB, &pitch2, size * sizeof(float), size);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
         goto Error;
     }
 
     size_t pitch3;
-    cudaStatus = cudaMallocPitch(&doCudaC, &pitch3, size * sizeof(float), size);
+    cudaStatus = cudaMallocPitch(&cudaMatrixC, &pitch3, size * sizeof(float), size);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
         goto Error;
@@ -91,40 +91,41 @@ cudaError_t CudaMultiplyMatrixes(float **aORG, float **bORG)
 
 
 
-    //kopia tablic do gpu
-    cudaStatus = cudaMemcpy2D(doCudaA, pitch, a, size * sizeof(float), size * sizeof(float), size, cudaMemcpyHostToDevice);
+    //copy arrays to GPU
+    cudaStatus = cudaMemcpy2D(cudaMatrixA, pitch, a, size * sizeof(float), size * sizeof(float), size, cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
     }
 
-    cudaStatus = cudaMemcpy2D(doCudaB, pitch2, b, size * sizeof(float), size * sizeof(float), size, cudaMemcpyHostToDevice);
+    cudaStatus = cudaMemcpy2D(cudaMatrixB, pitch2, b, size * sizeof(float), size * sizeof(float), size, cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
     }
-    cudaStatus = cudaMemcpy2D(doCudaC, pitch3, c, size * sizeof(float), size * sizeof(float), size, cudaMemcpyHostToDevice);
+    cudaStatus = cudaMemcpy2D(cudaMatrixC, pitch3, c, size * sizeof(float), size * sizeof(float), size, cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
     }
 
+    //calculate
     dim3 grid(ceilf(size / (float)32), ceilf(size / (float)32), 1);
     dim3 block(32, 32, 1);
 
     auto start = std::chrono::high_resolution_clock::now();
-    mult << < grid,block >> > (doCudaA, doCudaB, doCudaC);
+    mult << < grid,block >> > (cudaMatrixA, cudaMatrixB, cudaMatrixC);
     auto end = std::chrono::high_resolution_clock::now();
 
 
-    //cuda ma obsluge errorow
+    //check for errors
     cudaStatus = cudaGetLastError();
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, " launch failed: %s\n", cudaGetErrorString(cudaStatus));
         goto Error;
     }
 
-    //speaks for itself
+    
     cudaStatus = cudaDeviceSynchronize();
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
@@ -132,20 +133,20 @@ cudaError_t CudaMultiplyMatrixes(float **aORG, float **bORG)
     }
 
     //gpu->cpu
-    cudaStatus = cudaMemcpy2D(c, size*sizeof(float),doCudaC, pitch3, size * sizeof(float), size, cudaMemcpyDeviceToHost);
+    cudaStatus = cudaMemcpy2D(c, size*sizeof(float),cudaMatrixC, pitch3, size * sizeof(float), size, cudaMemcpyDeviceToHost);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
     }
     printf("\n\n\n\n\n\n\n\n\n\n\n");
-    //printCudaMatrix(c);
+    printCudaMatrix(c);
     for (int i = 0; i < 3; i++)
-        wyniki_przyk[i+3] = c[i];
-    printf("czas: %d microS\n", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+        results[i+3] = c[i];
+    printf("time: %d microS\n", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
 Error:
-    cudaFree(doCudaA);
-    cudaFree(doCudaB);
-    cudaFree(doCudaC);
+    cudaFree(cudaMatrixA);
+    cudaFree(cudaMatrixB);
+    cudaFree(cudaMatrixC);
 
     return cudaStatus;
 }
@@ -171,8 +172,8 @@ void multiplyMatrixes(float** a, float** b)
     auto end = std::chrono::high_resolution_clock::now();
     //printMatrix(c);
     for (int i = 0; i < 3; i++)
-        wyniki_przyk[i] = c[0][i];
-    printf("czas: %d microS\n", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+        results[i] = c[0][i];
+    printf("time: %d microS\n", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
 
 }
 
@@ -212,8 +213,9 @@ int main()
     multiplyMatrixes(a, b);
     CudaMultiplyMatrixes(a, b);
     for (int i = 0; i < 3; i++)
-        printf("wynikowa[%d] = %f\nwynikowa[%d] = %f\n", i, wyniki_przyk[i], i+3, wyniki_przyk[i+3]);
+        printf("results[%d] = %f\nresults[%d] = %f\n", i, results[i], i+3, results[i+3]);
   
+    /* //just a fun code to see the possibilities of CUDA
     int deviceCount, device;
     int gpuDeviceCount = 0;
     struct cudaDeviceProp properties;
@@ -228,7 +230,7 @@ int main()
                 
             }
     }
-
+    */
     return 0;
 }
 
